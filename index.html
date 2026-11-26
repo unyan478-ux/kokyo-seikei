@@ -927,6 +927,20 @@ async function exportSetup() {
   const how = await saveFile('公共政経_連携ファイル.json', JSON.stringify({ app: 'kps', v: 2, cloud: Cloud.cfg }));
   if (how !== 'cancel') bkMsg('連携ファイルを作りました。もう片方の端末でこのアプリを開き、いちばん下の「ファイルを読み込む」で読み込んでください。', false, 'cloud-msg');
 }
+/* a restore link: #restore=<base64url of raw-deflated records JSON>. The part after # never leaves the device. */
+async function restoreFromLink(b64) {
+  try { history.replaceState(null, '', location.pathname + location.search); } catch (e) { /* keep going */ }
+  try {
+    const bin = Uint8Array.from(atob(b64.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+    const text = await new Response(new Blob([bin]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).text();
+    const d = JSON.parse(text);
+    if (!d || d.app !== 'kps' || !d.prog || typeof d.prog !== 'object') throw new Error('format');
+    const res = mergeDoc(d);
+    Store.saveLocal(); if (res.changed || res.behind) Cloud.touch();
+    if (view === 'home') renderHome();
+    toast('これまでの記録を引き継ぎました（' + fmt(res.total) + '問）', 6000);
+  } catch (e) { toast('記録を引き継げませんでした', 5000); }
+}
 function importFile(file) {
   const r = new FileReader();
   r.onerror = () => bkMsg('ファイルを読めませんでした。', true);
@@ -1026,10 +1040,10 @@ function stackHtml(c, total) {
 const V = { home: $('#v-home'), quiz: $('#v-quiz'), result: $('#v-result'), read: $('#v-read') };
 let view = 'home', S = null, cur = null, lastResult = null, readUnit = null, sheetOn = false, booted = false, gallery = false, toastTimer = 0;
 function show(v) { if (!gallery) for (const k in V) V[k].hidden = k !== v; view = v; if (!gallery) window.scrollTo(0, 0); }
-function toast(msg) {
+function toast(msg, ms) {
   const el = $('#toast'); if (!el || gallery) return;
   el.textContent = msg; el.classList.add('on');
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('on'), 1500);
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('on'), ms || 1500);
 }
 /* ---------- look things up in ChatGPT (opens in a new tab; this tab keeps its place) ---------- */
 const CTX = '高校の「公共」「政治・経済」（大学入学共通テスト）を勉強しています。';
@@ -1919,7 +1933,8 @@ function boot() {
     if (h.indexOf('#gallery') === 0) { galleryMode(); return; }
     renderHome(); show('home');
     if (h === '#selftest') { DEMO = true; selfTest(); return; }
-    if (freshLook(LS.get(K_SESSION))) resume();
+    if (h.indexOf('#restore=') === 0) restoreFromLink(h.slice(9));
+    else if (freshLook(LS.get(K_SESSION))) resume();
     Cloud.init();
   }).catch(bootError);
 }
@@ -1927,7 +1942,12 @@ boot();
 })();
 </script>
 <script>
-if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(function () {});
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+  navigator.serviceWorker.register('sw.js').catch(function () {});
+  /* a new version took over: reload right away if the home screen is showing, so updates arrive without a second launch */
+  var hadSW = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener('controllerchange', function () { var h = document.getElementById('v-home'); if (hadSW && h && !h.hidden) location.reload(); });
+}
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(function () {});
 </script>
 </body>
