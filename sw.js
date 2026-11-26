@@ -1,6 +1,6 @@
-/* Offline cache for the phone version. build.py replaces d29374b6754c with a hash of the files,
+/* Offline cache for the phone version. build.py writes a hash of the files into VERSION below,
    so the phone picks up a new copy the next time it opens the app online. */
-const VERSION = 'd29374b6754c';
+const VERSION = '1fe9163fad4f';
 const CACHE = 'kps-app-' + VERSION;
 const FONTS = 'kps-fonts';
 const CORE = ['./', 'index.html', 'manifest.webmanifest', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
