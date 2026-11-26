@@ -104,8 +104,19 @@ button { font: inherit; color: inherit; }
 /* sync */
 .sync { font-size: 12px; color: var(--ink-3); display: inline-flex; align-items: center; gap: 6px; }
 .sync::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--new); }
-.sync.synced::before { background: var(--ok); }
-.sync.error::before, .sync.waiting::before { background: var(--red); }
+.sync.ok::before { background: var(--ok); }
+.sync.syncing::before, .sync.idle::before, .sync.offline::before { background: var(--lv2); }
+.sync.error::before, .sync.auth::before { background: var(--red); }
+.sync.auth { color: var(--red); }
+#cloud .sync { text-align: right; }
+.c-text { font-size: 13.5px; color: var(--ink-2); margin-bottom: 8px; }
+.c-text b { color: var(--ink); }
+.c-steps { margin: 4px 0 12px; padding-left: 1.4em; display: grid; gap: 6px; font-size: 13.5px; color: var(--ink-2); }
+.c-steps b { color: var(--ink); }
+.c-steps a { color: var(--focus); font-weight: 700; }
+.c-row { display: flex; gap: 8px; align-items: center; }
+.c-row .inp { flex: 1; min-width: 0; }
+#cloud .bk-msg { margin-top: 8px; font-size: 13px; }
 
 /* today */
 .t-main { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 16px; align-items: center; }
@@ -609,33 +620,67 @@ function accepted(q) {
 }
 const isMatch = (input, q) => { const n = normMatch(input); return n.length > 0 && accepted(q).has(n); };
 
-/* ---------- local + cloud store ----------
+/* ---------- records on this device ----------
    prog[id] = [正解数, 不正解数, 前回○なら1, 最終解答の時刻(秒), 段(box), 次の出題日(YYYYMMDD)]
-   log[YYYYMMDD] = [解いた数, ○△の数, 新しい問題の数, 復習の数, かかった秒数] */
+   logs = { base: {YYYYMMDD: [解いた数, ○△の数, 新しい問題の数, 復習の数, かかった秒数]}, <端末ID>: {...}, ... }
+   Each device writes only its own log, so adding the logs together never counts an answer twice.
+   'base' holds the history from before devices were told apart (merged by taking the larger number).
+   Store.log is the sum that the screens show. */
+const K_LOGS = 'kps.logs.v2', K_DEV = 'kps.device.v1', K_CLOUD = 'kps.cloud.v1', K_DIRTY = 'kps.dirty.v1';
+const DATA_REPO = 'unyan478-ux/kokyo-seikei-data';
+const TOKEN_URL = 'https://github.com/settings/personal-access-tokens/new?name=kokyo-seikei-sync&description='
+  + encodeURIComponent('公共・政経 一問一答の記録の同期用') + '&target_name=unyan478-ux&expires_in=180&contents=write';
+const obj = x => (x && typeof x === 'object' && !Array.isArray(x)) ? x : {};
 function defaultPrefs() {
   return { units: ORDER.slice(), types: ['qa', 'ex', 'mc', 'tf'], imp: 1, target: 'all', order: 'smart', count: 20,
-    budget: 60, chunk: 20, star1: false, typing: false };
+    budget: 60, chunk: 20, star1: false, typing: false, at: 0 };
+}
+function fixPrefs(pr) {
+  const P = Object.assign(defaultPrefs(), obj(pr));
+  P.units = (Array.isArray(P.units) ? P.units : []).filter(u => UNIT_INFO[u]);
+  if (!Array.isArray(P.types) || !P.types.length) P.types = ['qa', 'ex', 'mc', 'tf'];
+  if (!BUDGETS.includes(+P.budget)) P.budget = 60;
+  if (!CHUNKS.includes(+P.chunk)) P.chunk = 20;
+  P.budget = +P.budget; P.chunk = +P.chunk; P.star1 = !!P.star1; P.typing = !!P.typing; P.at = +P.at || 0;
+  if (P.target === 'todo') P.target = 'due';
+  return P;
 }
 const Store = {
-  prog: {}, marks: {}, log: {}, resetAt: 0, prefs: defaultPrefs(),
+  prog: {}, marks: {}, logs: {}, log: {}, resetAt: 0, prefs: defaultPrefs(), dev: '',
   load() {
     const p = LS.get(K_PROG); if (p && typeof p === 'object') this.prog = p;
-    const m = LS.get(K_META); if (m && typeof m === 'object') { this.marks = m.marks || {}; this.resetAt = +m.resetAt || 0; }
-    const lg = LS.get(K_LOG); if (lg && typeof lg === 'object') this.log = lg;
-    const pr = LS.get(K_PREFS);
-    this.prefs = Object.assign(defaultPrefs(), pr && typeof pr === 'object' ? pr : {});
-    const P = this.prefs;
-    P.units = (Array.isArray(P.units) ? P.units : []).filter(u => UNIT_INFO[u]);
-    if (!Array.isArray(P.types) || !P.types.length) P.types = ['qa', 'ex', 'mc', 'tf'];
-    if (!BUDGETS.includes(+P.budget)) P.budget = 60;
-    if (!CHUNKS.includes(+P.chunk)) P.chunk = 20;
-    P.budget = +P.budget; P.chunk = +P.chunk; P.star1 = !!P.star1; P.typing = !!P.typing;
-    if (P.target === 'todo') P.target = 'due';
+    const m = LS.get(K_META); if (m && typeof m === 'object') { this.marks = obj(m.marks); this.resetAt = +m.resetAt || 0; }
+    this.logs = obj(LS.get(K_LOGS));
+    // older copies of the app kept one shared log; fold it in every time (taking the larger number, so repeats do no harm)
+    const old = LS.get(K_LOG); if (old && typeof old === 'object') this.mergeLogMap('base', old);
+    this.dev = LS.get(K_DEV) || ('d' + Math.random().toString(36).slice(2, 10));
+    LS.set(K_DEV, this.dev);
+    this.sumLog();
+    this.prefs = fixPrefs(LS.get(K_PREFS));
   },
-  saveLocal() { LS.set(K_PROG, this.prog); LS.set(K_META, this.metaDoc()); LS.set(K_LOG, this.log); },
-  savePrefs() { LS.set(K_PREFS, this.prefs); },
+  mergeLogMap(key, src) {
+    let changed = false;
+    const dst = this.logs[key] || (this.logs[key] = {});
+    for (const d in obj(src)) {
+      const r = src[d]; if (!Array.isArray(r)) continue;
+      const l = dst[d] || [0, 0, 0, 0, 0];
+      const m = l.map((x, i) => Math.max(+x || 0, +r[i] || 0));
+      if (!dst[d] || m.some((x, i) => x !== l[i])) { dst[d] = m; changed = true; }
+    }
+    return changed;
+  },
+  sumLog() {
+    const out = {};
+    for (const k in this.logs) for (const d in this.logs[k]) {
+      const r = this.logs[k][d], o = out[d] || (out[d] = [0, 0, 0, 0, 0]);
+      for (let i = 0; i < 5; i++) o[i] += +r[i] || 0;
+    }
+    this.log = out;
+  },
+  own(day) { const mine = this.logs[this.dev]; return mine && mine[day] ? mine[day].slice() : null; },
+  saveLocal() { LS.set(K_PROG, this.prog); LS.set(K_META, this.metaDoc()); LS.set(K_LOGS, this.logs); },
+  savePrefs() { this.prefs.at = now(); LS.set(K_PREFS, this.prefs); Cloud.touch(); },
   metaDoc() { return { marks: this.marks, resetAt: this.resetAt }; },
-  logDoc() { return { d: this.log, resetAt: this.resetAt }; },
   status(id) { const b = boxOf(id); return b === 0 ? 'new' : b === 1 ? 'ng' : 'ok'; },
   marked(id) { const m = this.marks[id]; return !!(m && m[0]); },
   record(id, grade, secs) {
@@ -654,72 +699,22 @@ const Store = {
     r[3] = Math.max(now(), this.resetAt + 1);
     r[4] = box; r[5] = due;
     this.prog[id] = r;
-    const L = (this.log[t] || [0, 0, 0, 0, 0]).slice();
+    const mine = this.logs[this.dev] || (this.logs[this.dev] = {});
+    const L = (mine[t] || [0, 0, 0, 0, 0]).slice();
     L[0]++; if (grade !== 'ng') L[1]++; if (!old) L[2]++; else L[3]++;
     L[4] += Math.round(Math.min(120, Math.max(1, secs || 0)));
-    this.log[t] = L;
-    this.saveLocal(); Sync.touch(id.slice(0, 3)); Sync.touchLog();
+    mine[t] = L;
+    this.sumLog(); this.saveLocal(); Cloud.touch();
     return { box, due, isNew: !old };
   },
-  restore(id, rec, day, logEntry) {
+  restore(id, rec, day, ownEntry) {
     if (rec) this.prog[id] = rec; else delete this.prog[id];
-    if (logEntry) this.log[day] = logEntry; else delete this.log[day];
+    const mine = this.logs[this.dev] || (this.logs[this.dev] = {});
+    if (ownEntry) mine[day] = ownEntry; else delete mine[day];
+    this.sumLog();
   },
-  toggleMark(id) { const on = !this.marked(id); this.marks[id] = [on ? 1 : 0, Math.max(now(), this.resetAt + 1)]; this.saveLocal(); Sync.touch(null); return on; },
-  unitProg(u) { const o = {}; for (const id in this.prog) if (id.startsWith(u + '-')) o[id] = this.prog[id]; return o; },
-  unitsWithData() { const s = new Set(); for (const id in this.prog) s.add(id.slice(0, 3)); return s; },
-  mergeUnit(u, remote) {
-    let changed = false;
-    for (const id in remote) {
-      const r = remote[id];
-      if (!Array.isArray(r) || r.length < 4 || !(+r[3] > this.resetAt)) continue;
-      const l = this.prog[id];
-      if (!l || +r[3] > +l[3]) {
-        const rec = [r[0] | 0, r[1] | 0, r[2] ? 1 : 0, +r[3]];
-        if (r.length >= 6 && +r[4] > 0 && +r[5] > 0) { rec.push(+r[4], +r[5]); }
-        this.prog[id] = rec; changed = true;
-      }
-    }
-    for (const id in this.prog) {
-      if (!id.startsWith(u + '-')) continue;
-      const r = remote[id];
-      if (!r || +this.prog[id][3] > +r[3] || (this.prog[id].length > (r.length || 0))) { Sync.dirty.add(u); break; }
-    }
-    return changed;
-  },
-  mergeMeta(m) {
-    let changed = false;
-    const rReset = +m.resetAt || 0;
-    if (rReset > this.resetAt) {
-      this.resetAt = rReset;
-      for (const id in this.prog) if (!(this.prog[id][3] > rReset)) { delete this.prog[id]; changed = true; }
-      for (const id in this.marks) if (!(this.marks[id][1] > rReset)) { delete this.marks[id]; changed = true; }
-      this.log = {}; changed = true;
-    } else if (this.resetAt > rReset) Sync.metaDirty = true;
-    const rm = (m.marks && typeof m.marks === 'object') ? m.marks : {};
-    for (const id in rm) {
-      const r = rm[id];
-      if (!Array.isArray(r) || !(+r[1] > this.resetAt)) continue;
-      const l = this.marks[id];
-      if (!l || +r[1] > l[1]) { this.marks[id] = [r[0] ? 1 : 0, +r[1]]; changed = true; }
-    }
-    for (const id in this.marks) { const r = rm[id]; if (!r || this.marks[id][1] > +r[1]) { Sync.metaDirty = true; break; } }
-    return changed;
-  },
-  mergeLog(doc) {
-    let changed = false;
-    if ((+doc.resetAt || 0) < this.resetAt) { Sync.logDirty = true; return false; }
-    const rd = (doc.d && typeof doc.d === 'object') ? doc.d : {};
-    for (const d in rd) {
-      const r = rd[d]; if (!Array.isArray(r)) continue;
-      const l = this.log[d] || [0, 0, 0, 0, 0];
-      const m = l.map((x, i) => Math.max(+x || 0, +r[i] || 0));
-      if (m.some((x, i) => x !== l[i])) { this.log[d] = m; changed = true; }
-    }
-    for (const d in this.log) { const r = rd[d]; if (!r || this.log[d].some((x, i) => x > (+r[i] || 0))) { Sync.logDirty = true; break; } }
-    return changed;
-  },
-  reset() { this.resetAt = now(); this.prog = {}; this.marks = {}; this.log = {}; this.saveLocal(); LS.del(K_SESSION); Sync.touch(null); Sync.touchLog(); },
+  toggleMark(id) { const on = !this.marked(id); this.marks[id] = [on ? 1 : 0, Math.max(now(), this.resetAt + 1)]; this.saveLocal(); Cloud.touch(); return on; },
+  reset() { this.resetAt = now(); this.prog = {}; this.marks = {}; this.logs = {}; this.sumLog(); this.saveLocal(); LS.del(K_SESSION); Cloud.touch(); },
 };
 function srs(id) {
   const r = Store.prog[id];
@@ -732,149 +727,228 @@ const boxOf = id => { const s = srs(id); return s ? s.box : 0; };
 const lvOf = id => Math.min(4, boxOf(id));
 function spread(id) { let h = 0; for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0; return h % 4; }
 
-const Sync = {
-  state: 'local', col: null, dirty: new Set(), metaDirty: false, logDirty: false, timer: 0, busy: false, gotServer: false,
+/* ---------- one copy of the records: the cloud file, a backup file, an old claude.ai export ----------
+   { app:'kps', v:2, savedAt, by, resetAt, prog, marks, logs, prefs }   (v1 files have one shared `log` instead of `logs`) */
+function recordsDoc() {
+  return { app: 'kps', v: 2, savedAt: now(), by: Store.dev, resetAt: Store.resetAt, prog: Store.prog, marks: Store.marks, logs: Store.logs, prefs: Store.prefs };
+}
+/* Fold another copy into this device. Per question and per ☆ the newer answer wins; logs are kept per device;
+   a newer "reset" clears what came before it. `behind` = the other copy lacks something this device has. */
+function mergeDoc(d) {
+  let changed = false, behind = false;
+  const rReset = +d.resetAt || 0;
+  if (rReset > Store.resetAt) {
+    Store.resetAt = rReset;
+    for (const id in Store.prog) if (!(+Store.prog[id][3] > rReset)) { delete Store.prog[id]; changed = true; }
+    for (const id in Store.marks) if (!(+Store.marks[id][1] > rReset)) { delete Store.marks[id]; changed = true; }
+    Store.logs = {}; changed = true;
+  } else if (Store.resetAt > rReset) behind = true;
+  const rp = obj(d.prog);
+  let updated = 0, total = 0;
+  for (const id in rp) {
+    const r = rp[id];
+    if (!UNIT_INFO[id.slice(0, 3)] || !Array.isArray(r) || r.length < 4) continue;
+    total++;
+    if (!(+r[3] > Store.resetAt)) continue;
+    const l = Store.prog[id];
+    if (!l || +r[3] > +l[3]) {
+      const rec = [r[0] | 0, r[1] | 0, r[2] ? 1 : 0, +r[3]];
+      if (r.length >= 6 && +r[4] > 0 && +r[5] > 0) rec.push(+r[4], +r[5]);
+      Store.prog[id] = rec; changed = true; updated++;
+    }
+  }
+  for (const id in Store.prog) { const r = rp[id]; if (!Array.isArray(r) || +Store.prog[id][3] > +r[3]) { behind = true; break; } }
+  const rm = obj(d.marks);
+  for (const id in rm) {
+    const r = rm[id];
+    if (!Array.isArray(r) || !(+r[1] > Store.resetAt)) continue;
+    const l = Store.marks[id];
+    if (!l || +r[1] > +l[1]) { Store.marks[id] = [r[0] ? 1 : 0, +r[1]]; changed = true; }
+  }
+  for (const id in Store.marks) { const r = rm[id]; if (!Array.isArray(r) || +Store.marks[id][1] > +r[1]) { behind = true; break; } }
+  if (rReset >= Store.resetAt) {
+    if (d.logs && typeof d.logs === 'object') { for (const k in d.logs) changed = Store.mergeLogMap(k, d.logs[k]) || changed; }
+    else if (d.log && typeof d.log === 'object') changed = Store.mergeLogMap('base', d.log.d && typeof d.log.d === 'object' ? d.log.d : d.log) || changed;
+  }
+  const rl = obj(d.logs);
+  for (const k in Store.logs) {
+    const theirs = obj(rl[k]);
+    for (const day in Store.logs[k]) { const r = theirs[day]; if (!Array.isArray(r) || Store.logs[k][day].some((x, i) => x > (+r[i] || 0))) { behind = true; break; } }
+    if (behind) break;
+  }
+  const rpAt = +(obj(d.prefs).at) || 0;
+  if (rpAt > Store.prefs.at) { Store.prefs = fixPrefs(d.prefs); LS.set(K_PREFS, Store.prefs); changed = true; }
+  else if (Store.prefs.at > rpAt) behind = true;
+  Store.sumLog();
+  return { changed, behind, updated, total };
+}
+
+/* ---------- sync through a private GitHub repository (works without Claude; needs a token made once) ---------- */
+function b64enc(str) {
+  const b = new TextEncoder().encode(str); let s = '';
+  for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function b64dec(b64) {
+  const s = atob(String(b64).replace(/\s/g, '')), b = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
+  return new TextDecoder().decode(b);
+}
+function syncErr(kind, msg) { const e = new Error(msg); e.kind = kind; return e; }
+const hhmm = ms => { const d = new Date(ms); return d.getHours() + ':' + String(d.getMinutes()).padStart(2, '0'); };
+const Cloud = {
+  cfg: null, state: 'off', sha: null, timer: 0, busy: false, again: false, lastOk: 0, lastTry: 0, detail: '',
+  get dirty() { return !!LS.get(K_DIRTY); },
+  setDirty(v) { if (v) LS.set(K_DIRTY, 1); else LS.del(K_DIRTY); },
+  init() {
+    const c = LS.get(K_CLOUD);
+    this.cfg = c && typeof c.token === 'string' && c.token ? { token: c.token, repo: c.repo || DATA_REPO, path: c.path || 'records.json' } : null;
+    this.set(this.cfg ? 'idle' : 'off');
+    if (!this.cfg || DEMO) return;
+    this.listening = true; window.addEventListener('online', () => this.sync());
+    this.sync();
+  },
   label() {
-    return ({ local: 'この端末に保存', connecting: '同期の準備中…', synced: 'クラウドに保存済み',
-      waiting: '同期待ち（この端末には保存済み）', error: '同期できません（この端末には保存済み）', readonly: '記録はこの端末だけに保存' })[this.state];
+    return ({ off: 'この端末だけに保存（同期は未設定）', idle: '同期の準備中', syncing: '同期中…',
+      ok: '同期済み ' + (this.lastOk ? hhmm(this.lastOk) : ''), offline: 'オフライン：つながったら自動で同期します',
+      auth: '鍵が使えません（下の「同期」を確認）', error: '同期できませんでした（自動でやり直します）' })[this.state] || '';
   },
-  set(s) { this.state = s; document.querySelectorAll('.sync').forEach(el => { el.className = 'sync ' + s; el.textContent = this.label(); }); },
-  async init() {
-    const c = window.claude;
-    if (!c || typeof c.use !== 'function') return;
-    this.set('connecting');
-    let db = null, user = null, uid = null;
-    try { [db, user] = await Promise.all([c.use('db'), c.use('user')]); } catch (e) { db = null; }
-    if (db && user) { try { uid = await user.id(); } catch (e) { uid = null; } }
-    if (!db || !uid) { this.set('local'); return; }
-    try { this.col = db.collection('data/users/' + uid); } catch (e) { this.set('local'); return; }
-    const timer = setTimeout(() => { if (!this.gotServer && this.state === 'connecting') this.set('waiting'); }, 10000);
+  set(s, detail) {
+    this.state = s; if (detail !== undefined) this.detail = detail;
+    document.querySelectorAll('.sync').forEach(el => { el.className = 'sync ' + s; el.textContent = this.label(); });
+    const m = $('#cloud-msg'); if (m && (s === 'auth' || s === 'error')) { m.textContent = this.detail; m.classList.add('bad'); }
+    else if (m && s === 'ok' && m.classList.contains('bad')) { m.textContent = ''; m.classList.remove('bad'); }
+  },
+  async api(method, body) {
+    const c = this.cfg;
+    let r;
     try {
-      this.col.onSnapshot(snap => {
-        try { this.apply(snap); } catch (e) { console.error(e); }
-        if (!snap.metadata || !snap.metadata.fromCache) {
-          this.gotServer = true; clearTimeout(timer);
-          if (this.state === 'connecting' || this.state === 'waiting') this.set('synced');
-          if (this.dirty.size || this.metaDirty || this.logDirty) this.schedule();
-        }
-      }, err => { clearTimeout(timer); this.set(err && err.code === 'revoked' ? 'local' : 'error'); });
-    } catch (e) { clearTimeout(timer); this.set('error'); }
+      r = await fetch('https://api.github.com/repos/' + c.repo + '/contents/' + c.path, {
+        method, cache: 'no-store',
+        headers: Object.assign({ Authorization: 'Bearer ' + c.token, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' },
+          body ? { 'Content-Type': 'application/json' } : {}),
+        body: body ? JSON.stringify(body) : undefined,
+      });
+    } catch (e) { throw syncErr('offline', 'ネットにつながっていません'); }
+    if (r.status === 401) throw syncErr('auth', '鍵が正しくないか、期限が切れています。新しい鍵を作って、つなぎ直してください。');
+    if (r.status === 403 && method === 'PUT') throw syncErr('auth', '鍵に書き込みの権限がありません。鍵を作るときに Contents を「Read and write」にしてください。');
+    if (r.status === 403) throw syncErr('error', 'GitHub が一時的に使えません（' + r.status + '）');
+    if (r.status === 404 && method === 'PUT') throw syncErr('auth', 'この鍵では記録の置き場（kokyo-seikei-data）に書き込めません。鍵を作るときに Repository access で kokyo-seikei-data を選んでください。');
+    return r;
   },
-  apply(snap) {
-    let changed = false, sawLog = false;
-    const remoteUnits = new Set();
-    for (const d of snap.docs) {
-      const data = d.data && d.data();
-      if (!data) continue;
-      if (d.id === 'meta') changed = Store.mergeMeta(data) || changed;
-      else if (d.id === 'log') { sawLog = true; changed = Store.mergeLog(data) || changed; }
-      else if (d.id.startsWith('p-')) { const u = d.id.slice(2); remoteUnits.add(u); changed = Store.mergeUnit(u, data.p || {}) || changed; }
-    }
-    for (const u of Store.unitsWithData()) if (!remoteUnits.has(u)) this.dirty.add(u);
-    if (!sawLog && Object.keys(Store.log).length) this.logDirty = true;
-    if (changed) { Store.saveLocal(); UI.dataChanged(); }
+  async pull() {
+    const r = await this.api('GET');
+    if (r.status === 404) { this.sha = null; return null; }
+    if (!r.ok) throw syncErr('error', 'GitHub から読めませんでした（' + r.status + '）');
+    const j = await r.json();
+    this.sha = j.sha;
+    try { return JSON.parse(b64dec(j.content)); } catch (e) { return null; }
   },
-  touch(u) { if (u) this.dirty.add(u); else this.metaDirty = true; this.schedule(); },
-  touchLog() { this.logDirty = true; this.schedule(); },
-  schedule() { if (!this.col || this.state === 'readonly') return; clearTimeout(this.timer); this.timer = setTimeout(() => this.flush(), 1200); },
-  async flush() {
-    if (!this.col || this.busy || this.state === 'readonly') return;
-    this.busy = true;
+  async push() {
+    const body = { message: 'sync ' + Store.dev + ' ' + new Date().toISOString(), content: b64enc(JSON.stringify(recordsDoc())) };
+    if (this.sha) body.sha = this.sha;
+    const r = await this.api('PUT', body);
+    if (r.status === 409 || r.status === 422) throw syncErr('conflict', 'conflict');
+    if (!r.ok) throw syncErr('error', 'GitHub に書き込めませんでした（' + r.status + '）');
+    const j = await r.json();
+    this.sha = j.content && j.content.sha;
+  },
+  /* read the cloud copy, fold it in, and send ours back if the cloud copy lacks anything (retries when another device wrote in between) */
+  async sync() {
+    if (!this.cfg || DEMO) return;
+    if (this.busy) { this.again = true; return; }
+    clearTimeout(this.timer); this.timer = 0;
+    this.busy = true; this.lastTry = Date.now(); this.set('syncing');
     try {
-      while (this.col && (this.metaDirty || this.logDirty || this.dirty.size)) {
-        if (this.metaDirty) {
-          this.metaDirty = false;
-          try { await this.write('meta', Store.metaDoc()); } catch (e) { this.metaDirty = true; throw e; }
-          continue;
+      for (let i = 0; ; i++) {
+        const remote = await this.pull();
+        const res = remote && remote.app === 'kps' ? mergeDoc(remote) : { changed: false, behind: true };
+        if (res.changed) { Store.saveLocal(); UI.dataChanged(); }
+        if (res.behind) {
+          try { await this.push(); } catch (e) { if (e.kind === 'conflict' && i < 4) continue; throw e; }
         }
-        if (this.logDirty) {
-          this.logDirty = false;
-          try { await this.write('log', Store.logDoc()); } catch (e) { this.logDirty = true; throw e; }
-          continue;
-        }
-        const u = this.dirty.values().next().value;
-        this.dirty.delete(u);
-        try { await this.write('p-' + u, { p: Store.unitProg(u) }); } catch (e) { this.dirty.add(u); throw e; }
+        break;
       }
-      if (this.gotServer) this.set('synced');
+      this.setDirty(false); this.lastOk = Date.now(); this.set('ok');
     } catch (e) {
-      const code = e && e.code;
-      if (['invalid_argument', 'not_granted', 'capability_disabled', 'capability_removed', 'revoked'].includes(code)) { this.col = null; this.set('readonly'); }
-      else this.set('error');
-    } finally { this.busy = false; }
-  },
-  async write(id, body) {
-    try { await this.col.doc(id).set(body); }
-    catch (e) {
-      if (e && (e.code === 'unavailable' || e.code === 'resource_exhausted')) {
-        await new Promise(r => setTimeout(r, 700 + Math.random() * 1300));
-        await this.col.doc(id).set(body);
-      } else throw e;
+      const k = e.kind === 'offline' || e.kind === 'auth' ? e.kind : 'error';
+      this.set(k, e.message);
+      if (k !== 'auth') this.schedule(k === 'offline' ? 60000 : 30000);
+    } finally {
+      this.busy = false;
+      if (this.again) { this.again = false; this.schedule(2000); }
     }
   },
+  schedule(ms) { if (!this.cfg || DEMO) return; if (this.timer) return; this.timer = setTimeout(() => { this.timer = 0; this.sync(); }, ms); },
+  /* after an answer: send at most every 2 minutes while studying; leaving a set or the app sends right away */
+  touch() { if (DEMO) return; this.setDirty(true); this.schedule(120000); },
+  soon() { if (this.cfg && this.dirty) { clearTimeout(this.timer); this.timer = 0; this.schedule(1500); } },
+  onVisible() { if (this.cfg && Date.now() - this.lastTry > 30000) this.sync(); },
+  onHidden() { if (this.cfg && this.dirty) this.sync(); },
+  async connect(token, repo, path) {
+    if (!/^[A-Za-z0-9_]{20,}$/.test(token)) throw syncErr('auth', '鍵の形がちがいます。github_pat_ で始まる文字を、前後の空白なしで貼りつけてください。');
+    const prev = this.cfg;
+    this.cfg = { token, repo: repo || DATA_REPO, path: path || 'records.json' };
+    try { await this.pull(); }
+    catch (e) { this.cfg = prev; throw e; }
+    if (!this.listening) { this.listening = true; window.addEventListener('online', () => this.sync()); }
+    await this.sync();
+    if (this.state === 'auth') { const msg = this.detail; this.cfg = prev; this.set(prev ? 'idle' : 'off'); throw syncErr('auth', msg); }
+    LS.set(K_CLOUD, this.cfg);
+  },
+  disconnect() { this.cfg = null; LS.del(K_CLOUD); clearTimeout(this.timer); this.timer = 0; this.set('off'); },
 };
 
-/* ---------- backup file: carry records between devices without any cloud ----------
-   { app:'kps', v:1, savedAt, resetAt, prog, marks, log, prefs } — merged with the same rules as the cloud sync */
-let DL = null;
-function initDownloads() {
-  const c = window.claude;
-  if (c && typeof c.use === 'function') c.use('downloads').then(d => { DL = d; }).catch(() => { DL = null; });
-}
-function backupDoc() {
-  return { app: 'kps', v: 1, savedAt: now(), resetAt: Store.resetAt, prog: Store.prog, marks: Store.marks, log: Store.log, prefs: Store.prefs };
-}
-function bkMsg(text, bad) { const el = $('#bk-msg'); if (el) { el.textContent = text; el.classList.toggle('bad', !!bad); } }
+/* ---------- files: backup, moving records, and the setup file that connects another device ---------- */
+function bkMsg(text, bad, id) { const el = $('#' + (id || 'bk-msg')); if (el) { el.textContent = text; el.classList.toggle('bad', !!bad); } }
 const isIOS = () => /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-async function exportBackup() {
-  const name = '公共政経_記録_' + today() + '.json';
-  const text = JSON.stringify(backupDoc());
-  const done = '書き出しました（' + fmt(Object.keys(Store.prog).length) + '問分）。';
-  if (DL) {
-    try { await DL.save({ filename: name, data: text }); bkMsg(done); }
-    catch (e) { const code = e && e.code; bkMsg(code === 'declined' ? '書き出しをやめました。' : '書き出せませんでした（' + (code || e) + '）。', code !== 'declined'); }
-    return;
-  }
+async function saveFile(name, text) {
   const blob = new Blob([text], { type: 'application/json' });
   if (isIOS() && navigator.canShare && typeof File === 'function') {
     try {
       const f = new File([blob], name, { type: 'application/json' });
-      if (navigator.canShare({ files: [f] })) { await navigator.share({ files: [f] }); bkMsg(done + '「ファイルに保存」を選んだ場所にあります。'); return; }
-    } catch (e) { if (e && e.name === 'AbortError') { bkMsg('書き出しをやめました。'); return; } }
+      if (navigator.canShare({ files: [f] })) { await navigator.share({ files: [f] }); return 'shared'; }
+    } catch (e) { if (e && e.name === 'AbortError') return 'cancel'; }
   }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click();
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
-  bkMsg(done + 'ダウンロードフォルダに「' + name + '」があります。');
+  return 'downloaded';
 }
-function mergeBackup(d) {
-  const wasEmpty = !Object.keys(Store.prog).length;
-  const prevTs = {}; for (const id in Store.prog) prevTs[id] = +Store.prog[id][3];
-  const rReset = +d.resetAt || 0;
-  Store.mergeMeta({ marks: d.marks && typeof d.marks === 'object' ? d.marks : {}, resetAt: rReset });
-  const byU = {};
-  for (const id in d.prog) { const u = id.slice(0, 3); if (UNIT_INFO[u]) (byU[u] = byU[u] || {})[id] = d.prog[id]; }
-  for (const u in byU) Store.mergeUnit(u, byU[u]);
-  Store.mergeLog({ d: d.log && typeof d.log === 'object' ? d.log : {}, resetAt: rReset });
-  let updated = 0, total = 0;
-  for (const u in byU) for (const id in byU[u]) { total++; const r = Store.prog[id]; if (r && +r[3] !== prevTs[id]) updated++; }
-  Store.saveLocal();
-  if (wasEmpty && d.prefs && typeof d.prefs === 'object') { LS.set(K_PREFS, d.prefs); Store.load(); }
-  for (const u in byU) Sync.dirty.add(u);
-  Sync.metaDirty = true; Sync.logDirty = true; Sync.schedule();
-  return { updated, total };
+async function exportBackup() {
+  const name = '公共政経_記録_' + today() + '.json';
+  const how = await saveFile(name, JSON.stringify(recordsDoc()));
+  const n = fmt(Object.keys(Store.prog).length);
+  if (how === 'cancel') bkMsg('書き出しをやめました。');
+  else bkMsg('書き出しました（' + n + '問分）。' + (how === 'shared' ? '「ファイルに保存」を選んだ場所にあります。' : 'ダウンロードフォルダに「' + name + '」があります。'));
 }
-function importBackup(file) {
+async function exportSetup() {
+  if (!Cloud.cfg) return;
+  const how = await saveFile('公共政経_連携ファイル.json', JSON.stringify({ app: 'kps', v: 2, cloud: Cloud.cfg }));
+  if (how !== 'cancel') bkMsg('連携ファイルを作りました。もう片方の端末でこのアプリを開き、いちばん下の「ファイルを読み込む」で読み込んでください。', false, 'cloud-msg');
+}
+function importFile(file) {
   const r = new FileReader();
   r.onerror = () => bkMsg('ファイルを読めませんでした。', true);
-  r.onload = () => {
+  r.onload = async () => {
     let d = null;
     try { d = JSON.parse(String(r.result).replace(/^﻿/, '')); } catch (e) { d = null; }
-    if (!d || typeof d !== 'object' || !d.prog || typeof d.prog !== 'object' || Array.isArray(d.prog)) { bkMsg('このアプリの記録ファイルではないようです（' + file.name + '）。', true); return; }
-    const res = mergeBackup(d);
-    renderHome();
-    bkMsg(res.updated ? '読み込みました。' + fmt(res.updated) + '問の記録が新しくなりました（ファイル内 ' + fmt(res.total) + '問）。'
-      : '読み込みました。ファイルの記録はこの端末と同じか古いので、変わった記録はありません。');
+    const cloud = d && d.app === 'kps' && d.cloud && typeof d.cloud.token === 'string' ? d.cloud : null;
+    if (!d || (!cloud && (!d.prog || typeof d.prog !== 'object' || Array.isArray(d.prog)))) { bkMsg('このアプリのファイルではないようです（' + file.name + '）。', true); return; }
+    let msg = '';
+    if (d.prog) {
+      const res = mergeDoc(d);
+      Store.saveLocal(); if (res.behind || res.changed) Cloud.touch();
+      msg = res.updated ? '記録を読み込みました。' + fmt(res.updated) + '問の記録が新しくなりました（ファイル内 ' + fmt(res.total) + '問）。'
+        : '記録を読み込みました。ファイルの記録はこの端末と同じか古いので、変わった記録はありません。';
+    }
+    if (cloud) {
+      bkMsg('連携ファイルを確かめています…');
+      try { await Cloud.connect(cloud.token, cloud.repo, cloud.path); msg += '同期をつなぎました。これからは自動で記録がそろいます。'; }
+      catch (e) { renderHome(); bkMsg('連携できませんでした：' + e.message, true); return; }
+    }
+    renderHome(); bkMsg(msg);
+    if (d.prog) Cloud.soon();
   };
   r.readAsText(file);
 }
@@ -1034,6 +1108,7 @@ function renderHome() {
     <section class="sheet" id="heat">${heatHtml()}</section>
     <section class="sheet" id="units">${unitsHtml()}</section>
     <section class="sheet" id="settings">${settingsHtml()}</section>
+    <section class="sheet" id="cloud">${cloudHtml()}</section>
     <details class="sheet" id="custom"><summary>条件を選んで解く</summary>${customHtml()}</details>
     <section class="sheet">
       <div class="sec-head"><h2><label for="search">用語・キーワードでさがす</label></h2></div>
@@ -1042,11 +1117,11 @@ function renderHome() {
     </section>
     <section class="sheet howto">${howtoHtml()}</section>
     <div class="foot">
-      <p>答えるたびに記録が自動で保存されます。<span class="sync ${Sync.state}">${esc(Sync.label())}</span></p>
+      <p>答えるたびに記録がこの端末に保存されます。<span class="sync ${Cloud.state}">${esc(Cloud.label())}</span></p>
       <div class="backup">
-        <b>記録のバックアップ・引っ越し</b>
-        <span>記録をファイルに書き出して、別の端末（スマホ⇔パソコン）で読み込めます。読み込むと今の記録と合わせて、問題ごとに新しいほうが残ります。</span>
-        <div class="bk-btns"><button type="button" class="btn small" data-act="export">記録を書き出す</button><button type="button" class="btn small" data-act="import">記録を読み込む</button></div>
+        <b>ファイル（バックアップ・引っ越し・連携）</b>
+        <span>記録をファイルに書き出して保管したり、別の端末で読み込んだりできます。読み込むと今の記録と合わせて、問題ごとに新しいほうが残ります。「連携ファイル」もここから読み込みます。</span>
+        <div class="bk-btns"><button type="button" class="btn small" data-act="export">記録を書き出す</button><button type="button" class="btn small" data-act="import">ファイルを読み込む</button></div>
         <input type="file" id="import-file" accept=".json,application/json,text/plain" hidden>
         <p class="bk-msg" id="bk-msg" role="status"></p>
       </div>
@@ -1195,6 +1270,29 @@ function settingsHtml() {
     + '<p class="hint">夜勤の日は60分、休みの日や12/27からは90分がおすすめ。目安時間を超えないように、復習が多い日は新しい問題が自動で減ります。</p>';
 }
 
+function cloudHtml() {
+  if (!Cloud.cfg) return `
+  <div class="sec-head"><h2>パソコンとスマホの同期</h2><span class="sync ${Cloud.state}">${esc(Cloud.label())}</span></div>
+  <p class="c-text">あなたの GitHub の非公開の置き場（kokyo-seikei-data）に記録を置き、ネットにつながったときに自動でそろえます。オフラインで解いた分も、次につながったときに送られます。Claude がなくても動きます。</p>
+  <p class="c-text"><b>はじめに1回だけ</b>、記録の置き場に入るための「鍵」を作って、ここに貼りつけます。</p>
+  <ol class="c-steps">
+    <li><a href="${TOKEN_URL}" target="_blank" rel="noopener">GitHub の鍵を作るページ</a>を開く（GitHub にログインした状態で）</li>
+    <li>「Repository access」で <b>Only select repositories</b> を選び、<b>kokyo-seikei-data</b> を選ぶ</li>
+    <li>「Permissions」に <b>Contents：Read and write</b> があるか確かめる（なければ「Add permissions」→ Contents → Read and write）</li>
+    <li>いちばん下の <b>Generate token</b> を押し、出てきた <b>github_pat_</b> で始まる文字をコピーする</li>
+    <li>下に貼りつけて「つなぐ」</li>
+  </ol>
+  <div class="c-row"><input id="cloud-token" class="inp" type="password" placeholder="github_pat_…" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="GitHub の鍵"><button type="button" class="btn primary" data-act="cloud-connect">つなぐ</button></div>
+  <p class="hint">2台目からは、1台目で作った「連携ファイル」を、いちばん下の「ファイルを読み込む」で読み込むだけでつながります（鍵を貼りつけてもOK）。</p>
+  <p class="bk-msg" id="cloud-msg" role="status"></p>`;
+  return `
+  <div class="sec-head"><h2>パソコンとスマホの同期</h2><span class="sync ${Cloud.state}">${esc(Cloud.label())}</span></div>
+  <p class="c-text">ネットにつながっているあいだ、記録は自動でほかの端末とそろいます。オフラインで解いた分も、次につながったときに送られます。</p>
+  <div class="bk-btns"><button type="button" class="btn small" data-act="cloud-now">今すぐ同期</button><button type="button" class="btn small" data-act="cloud-file">別の端末用の連携ファイルを作る</button><button type="button" class="btn small ghost" data-act="cloud-off">この端末の同期をやめる</button></div>
+  <p class="hint">連携ファイルを、もう片方の端末のこのアプリで「ファイルを読み込む」から読み込むと、そちらもつながります。鍵が入っているので、人には渡さないでください（読み込んだら消してOK）。</p>
+  <p class="bk-msg" id="cloud-msg" role="status"></p>`;
+}
+
 const OPTS = [
   { key: 'types', label: '形式', multi: true, items: [['qa', '一問一答'], ['ex', '説明'], ['mc', '4択'], ['tf', '○×']] },
   { key: 'imp', label: '重要度', items: [[1, 'すべて'], [2, '★★以上'], [3, '★★★のみ']] },
@@ -1314,7 +1412,7 @@ function renderQuestion() {
 }
 function commit(grade) {
   const id = cur.q.id, t = today();
-  cur.undo = { rec: Store.prog[id] ? Store.prog[id].slice() : null, day: t, log: Store.log[t] ? Store.log[t].slice() : null };
+  cur.undo = { rec: Store.prog[id] ? Store.prog[id].slice() : null, day: t, log: Store.own(t) };
   cur.grade = grade; cur.ok = grade !== 'ng';
   cur.info = Store.record(id, grade, (Date.now() - cur.t0) / 1000);
   S.res.push({ id, ok: cur.ok, g: grade, b: cur.info.box });
@@ -1336,9 +1434,9 @@ function next() { if (!S) return goHome(); if (S.i >= S.ids.length) finish(); el
 function finish() {
   lastResult = { res: S ? S.res.slice() : [], label: S ? S.label : '' };
   LS.del(K_SESSION); S = null; cur = null;
-  show('result'); renderResult();
+  show('result'); renderResult(); Cloud.soon();
 }
-function goHome() { cur = null; show('home'); renderHome(); }
+function goHome() { cur = null; show('home'); renderHome(); Cloud.soon(); }
 
 /* ---------- quiz rendering ---------- */
 const MARK_OK = '<svg class="mark" viewBox="0 0 100 100" aria-hidden="true"><path d="M52 12 C76 11 91 29 90 51 C89 75 71 90 49 89 C26 88 11 72 12 49 C13 28 30 13 57 15"/></svg>';
@@ -1626,13 +1724,24 @@ document.addEventListener('click', e => {
     case 'reset-no': $('#reset-area').innerHTML = '<button type="button" class="linkbtn" data-act="reset-ask">学習記録をリセット</button>'; break;
     case 'retry-load': location.reload(); break;
     case 'export': exportBackup(); break;
+    case 'cloud-connect': {
+      const inp = $('#cloud-token'), tok = inp ? inp.value.trim() : '';
+      if (!tok) { bkMsg('鍵を貼りつけてから押してください。', true, 'cloud-msg'); break; }
+      el.disabled = true; bkMsg('確かめています…', false, 'cloud-msg');
+      Cloud.connect(tok).then(() => { $('#cloud').innerHTML = cloudHtml(); bkMsg('つなぎました。これからは自動で記録がそろいます。ほかの端末は「別の端末用の連携ファイルを作る」でつなげます。', false, 'cloud-msg'); })
+        .catch(e => { el.disabled = false; bkMsg(e.message, true, 'cloud-msg'); });
+      break;
+    }
+    case 'cloud-now': Cloud.sync(); break;
+    case 'cloud-file': exportSetup(); break;
+    case 'cloud-off': Cloud.disconnect(); $('#cloud').innerHTML = cloudHtml(); bkMsg('この端末の同期をやめました。記録はこの端末に残っています。', false, 'cloud-msg'); break;
     case 'import': { const f = $('#import-file'); if (f) { f.value = ''; f.click(); } break; }
   }
 });
 document.addEventListener('change', e => {
   if (e.target.id !== 'import-file') return;
   const f = e.target.files && e.target.files[0];
-  if (f) importBackup(f);
+  if (f) importFile(f);
 });
 document.addEventListener('change', e => {
   const cb = e.target.closest && e.target.closest('input[data-pick]'); if (!cb) return;
@@ -1662,8 +1771,8 @@ document.addEventListener('keydown', e => {
   } else if (cur.phase === 'done' && !typing && tag !== 'button' && (k === 'Enter' || k === 'ArrowRight')) { e.preventDefault(); next(); }
 });
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') { Sync.flush(); if (view === 'quiz' && S && cur) saveLook(); }
-  else if (view === 'home') refreshHome();
+  if (document.visibilityState === 'hidden') { if (view === 'quiz' && S && cur) saveLook(); Cloud.onHidden(); }
+  else { if (view === 'home') refreshHome(); Cloud.onVisible(); }
 });
 
 /* ---------- self-check and screenshot modes (local testing only) ---------- */
@@ -1725,17 +1834,48 @@ function selfTest() {
     unitSession('u07'); out.push('unitSession=' + (S ? S.ids.length : 0)); goHome();
     const c5 = levelCounts(Q); out.push('levels=' + c5.join('/') + ' log=' + JSON.stringify(Store.log[today()]));
     for (const id of ['today', 'progress', 'heat', 'units', 'settings']) if (!$('#' + id) || !$('#' + id).innerHTML.trim()) errs.push('empty section ' + id);
-    // backup file round trip: export, wipe, import, compare; then importing an older copy must not overwrite newer records
-    const bk = JSON.parse(JSON.stringify(backupDoc()));
+    for (const id of ['cloud']) if (!$('#' + id) || !$('#' + id).innerHTML.trim()) errs.push('empty section ' + id);
+    // records file round trip: export, wipe, import, compare; then importing an older copy must not overwrite newer records
     const canon = o => JSON.stringify(Object.keys(o).sort().map(k => [k, o[k]]));
+    const bk = JSON.parse(JSON.stringify(recordsDoc()));
     const nBk = Object.keys(bk.prog).length, keyBefore = canon(Store.prog), logBefore = canon(Store.log);
-    Store.prog = {}; Store.log = {}; Store.marks = {};
-    let mr = mergeBackup(bk);
-    if (canon(Store.prog) !== keyBefore || canon(Store.log) !== logBefore || mr.updated !== nBk) errs.push('backup round trip ' + JSON.stringify(mr) + ' n=' + nBk);
+    Store.prog = {}; Store.logs = {}; Store.marks = {}; Store.sumLog();
+    let mr = mergeDoc(bk);
+    if (canon(Store.prog) !== keyBefore || canon(Store.log) !== logBefore || mr.updated !== nBk || mr.behind) errs.push('backup round trip ' + JSON.stringify(mr) + ' n=' + nBk);
     const id0 = Object.keys(Store.prog)[0], newer = Store.prog[id0].slice(); newer[3] = +newer[3] + 100; newer[0] = 99; Store.prog[id0] = newer;
-    mr = mergeBackup(bk);
-    if (Store.prog[id0][0] !== 99 || mr.updated !== 0) errs.push('backup kept newer ' + JSON.stringify(mr));
+    mr = mergeDoc(bk);
+    if (Store.prog[id0][0] !== 99 || mr.updated !== 0 || !mr.behind) errs.push('backup kept newer ' + JSON.stringify(mr));
     out.push('backup=' + nBk + ' records ok');
+    // two devices: each keeps its own log, so a day studied on both adds up instead of taking the larger number
+    const day = today(), before = (Store.log[day] || [0])[0];
+    const other = { app: 'kps', v: 2, resetAt: Store.resetAt, prog: {}, marks: {}, logs: { dOTHER: { [day]: [7, 5, 3, 4, 300] } }, prefs: { at: 0 } };
+    mr = mergeDoc(other);
+    if ((Store.log[day] || [0])[0] !== before + 7 || !mr.changed || !mr.behind) errs.push('device logs add ' + JSON.stringify(Store.log[day]) + ' before=' + before);
+    mr = mergeDoc(other);
+    if ((Store.log[day] || [0])[0] !== before + 7 || mr.changed) errs.push('device logs repeat ' + JSON.stringify(Store.log[day]));
+    // an old single-log file (v1 / claude.ai) goes into the shared base log, taking the larger number
+    mr = mergeDoc({ app: 'kps', v: 1, prog: {}, log: { 20261101: [10, 8, 5, 5, 600] } });
+    mr = mergeDoc({ app: 'kps', v: 1, prog: {}, log: { 20261101: [6, 6, 6, 0, 100] } });
+    if (JSON.stringify(Store.log[20261101]) !== '[10,8,6,5,600]') errs.push('v1 log ' + JSON.stringify(Store.log[20261101]));
+    // settings follow the newer copy
+    const at0 = Store.prefs.at;
+    mergeDoc({ app: 'kps', v: 2, prog: {}, prefs: Object.assign({}, Store.prefs, { budget: 90, at: at0 + 50 }) });
+    if (Store.prefs.budget !== 90) errs.push('prefs newer ' + Store.prefs.budget);
+    mergeDoc({ app: 'kps', v: 2, prog: {}, prefs: Object.assign({}, Store.prefs, { budget: 30, at: at0 + 10 }) });
+    if (Store.prefs.budget !== 90) errs.push('prefs older ' + Store.prefs.budget);
+    // undo of a fluke on this device restores only this device's log
+    const q9 = Q[9].id, own0 = Store.own(day), tot0 = (Store.log[day] || [0])[0];
+    Store.record(q9, 'ok', 5); Store.restore(q9, null, day, own0);
+    if ((Store.log[day] || [0])[0] !== tot0) errs.push('restore own log ' + JSON.stringify(Store.log[day]) + ' vs ' + tot0);
+    // a reset on another device wins over older records
+    const rs = now() + 5;
+    mr = mergeDoc({ app: 'kps', v: 2, resetAt: rs, prog: {}, marks: {}, logs: {} });
+    if (Object.keys(Store.prog).length || Object.keys(Store.log).length || Store.resetAt !== rs) errs.push('remote reset ' + Object.keys(Store.prog).length);
+    // file content survives base64 with Japanese text
+    const txt = JSON.stringify({ a: '公共・政経 ☆', n: 1 });
+    if (b64dec(b64enc(txt)) !== txt) errs.push('base64');
+    if (Cloud.label() === '') errs.push('cloud label');
+    out.push('sync merge ok');
   } catch (e) { errs.push('EXC ' + e.message + ' @ ' + (e.stack || '').split('\n').slice(0, 3).join(' | ')); }
   out.push('errors=' + errs.length); errs.slice(0, 20).forEach(x => out.push(x));
   dataErrors.slice(0, 20).forEach(x => out.push('dataError ' + x));
@@ -1750,7 +1890,9 @@ function seedDemo() {
     const box = [1, 2, 2, 3, 3, 4, 4, 5][q.n % 8], age = q.n % 9;
     Store.prog[q.id] = [box > 1 ? 2 : 1, box > 2 ? 0 : 1, box > 1 ? 1 : 0, base - age * 86400, box, addD(t, (q.n % 5) - 1)];
   }
-  for (let k = 0; k < 20; k++) { const n = [0, 35, 48, 62, 20, 0, 75, 90, 41, 55][k % 10]; if (n) Store.log[addD(t, -k)] = [n, Math.round(n * .7), Math.round(n * .5), Math.round(n * .5), n * 18]; }
+  Store.logs = { base: {} };
+  for (let k = 0; k < 20; k++) { const n = [0, 35, 48, 62, 20, 0, 75, 90, 41, 55][k % 10]; if (n) Store.logs.base[addD(t, -k)] = [n, Math.round(n * .7), Math.round(n * .5), Math.round(n * .5), n * 18]; }
+  Store.sumLog();
 }
 function galleryMode() {
   gallery = true; DEMO = true;
@@ -1778,7 +1920,7 @@ function boot() {
     renderHome(); show('home');
     if (h === '#selftest') { DEMO = true; selfTest(); return; }
     if (freshLook(LS.get(K_SESSION))) resume();
-    Sync.init(); initDownloads();
+    Cloud.init();
   }).catch(bootError);
 }
 boot();
