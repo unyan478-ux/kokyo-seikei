@@ -33,6 +33,7 @@
   --lv3: #6DB58A;          /* 覚えた */
   --lv4: #157556;          /* 定着 */
   --heat1: #D3EADD; --heat2: #98CDAE; --heat3: #4FA57A; --heat4: #157556;
+  --on-heat3: #1E2329; --on-heat4: #FFFFFF;
   --sheet: rgba(212, 28, 50, 0.88); /* 赤シート */
   --focus: #2B5CB8;
   --shadow: 0 1px 2px rgba(23, 35, 60, .06), 0 6px 20px rgba(23, 35, 60, .05);
@@ -45,6 +46,7 @@
     --red: #FF6B7F; --red-soft: #3B1F26; --on-red: #1B1F25; --ans: #FFA46B; --marker: #514914; --ok: #4CC79A; --ng: #FF6B7F;
     --new: #353D49; --lv1: #FF6B7F; --lv2: #F2B455; --lv3: #2F7D58; --lv4: #4CC79A;
     --heat1: #1E3A2D; --heat2: #2A5E45; --heat3: #3B8B63; --heat4: #4CC79A;
+    --on-heat3: #121519; --on-heat4: #121519;
     --sheet: rgba(196, 34, 56, 0.92); --focus: #8DB2FF; --shadow: 0 1px 2px rgba(0, 0, 0, .35), 0 6px 20px rgba(0, 0, 0, .25);
     color-scheme: dark;
   }
@@ -54,6 +56,7 @@
   --red: #FF6B7F; --red-soft: #3B1F26; --on-red: #1B1F25; --ans: #FFA46B; --marker: #514914; --ok: #4CC79A; --ng: #FF6B7F;
   --new: #353D49; --lv1: #FF6B7F; --lv2: #F2B455; --lv3: #2F7D58; --lv4: #4CC79A;
   --heat1: #1E3A2D; --heat2: #2A5E45; --heat3: #3B8B63; --heat4: #4CC79A;
+  --on-heat3: #121519; --on-heat4: #121519;
   --sheet: rgba(196, 34, 56, 0.92); --focus: #8DB2FF; --shadow: 0 1px 2px rgba(0, 0, 0, .35), 0 6px 20px rgba(0, 0, 0, .25);
   color-scheme: dark;
 }
@@ -182,12 +185,17 @@ button { font: inherit; color: inherit; }
 .part-name:first-child { margin-top: 0; }
 
 /* heat */
-.heat { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; max-width: 340px; }
+.heat { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; max-width: 560px; }
 .heat .dow { font-size: 10.5px; color: var(--ink-3); text-align: center; }
-.heat i { display: block; aspect-ratio: 1; max-width: 100%; border-radius: 4px; background: var(--new); }
-.heat i.h1 { background: var(--heat1); } .heat i.h2 { background: var(--heat2); } .heat i.h3 { background: var(--heat3); } .heat i.h4 { background: var(--heat4); }
-.heat i.fut { background: transparent; border: 1px dashed var(--rule); }
-.heat i.now { outline: 2px solid var(--ink); outline-offset: -2px; }
+/* each day: the date on top, the number solved below it */
+.heat .hc { min-width: 0; min-height: 46px; padding: 3px 2px 4px; border-radius: 5px; background: var(--new); color: var(--ink-2); display: grid; grid-template-rows: auto 1fr; justify-items: center; align-items: center; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.heat .hd { font-size: 10px; letter-spacing: -.02em; white-space: nowrap; }
+.heat .hc b { font-size: 14px; }
+.heat .h1, .heat .h2 { color: var(--ink); }
+.heat .h1 { background: var(--heat1); } .heat .h2 { background: var(--heat2); }
+.heat .h3 { background: var(--heat3); color: var(--on-heat3); } .heat .h4 { background: var(--heat4); color: var(--on-heat4); }
+.heat .fut { background: transparent; border: 1px dashed var(--rule); color: var(--ink-3); opacity: .7; }
+.heat .now { outline: 2px solid var(--ink); outline-offset: -2px; }
 .heat-stats { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 13px; color: var(--ink-2); margin-top: 12px; }
 .heat-stats b { font-size: 19px; color: var(--ink); font-variant-numeric: tabular-nums; margin-right: 2px; }
 .heat-key { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--ink-3); margin-top: 8px; }
@@ -1237,10 +1245,10 @@ function heatHtml() {
   let week = 0, wsum = 0, wdays = 0;
   for (let k = 0; k < 56; k++) {
     const d = addD(start, k);
-    if (d > t) { cells += '<i class="fut" aria-hidden="true"></i>'; continue; }
+    if (d > t) { cells += `<div class="hc fut" aria-hidden="true"><span class="hd">${md(d)}</span></div>`; continue; }
     const n = (Store.log[d] || [0])[0];
     const h = n >= 100 ? 4 : n >= 50 ? 3 : n >= 20 ? 2 : n > 0 ? 1 : 0;
-    cells += `<i class="${h ? 'h' + h : ''}${d === t ? ' now' : ''}" title="${md(d)} ${n}問" aria-label="${md(d)} ${n}問"></i>`;
+    cells += `<div class="hc${h ? ' h' + h : ''}${d === t ? ' now' : ''}" title="${md(d)} ${n}問" aria-label="${md(d)} ${n}問"><span class="hd">${md(d)}</span>${n ? `<b>${n}</b>` : ''}</div>`;
     if (k >= 49) { week += n; if (n) wdays++; }
   }
   for (let k = 0; k < 7; k++) { const L = Store.log[addD(t, -k)]; if (L) wsum += L[0]; }
