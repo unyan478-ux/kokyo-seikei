@@ -812,6 +812,8 @@ const Cloud = {
     const c = LS.get(K_CLOUD);
     this.cfg = c && typeof c.token === 'string' && c.token ? { token: c.token, repo: c.repo || DATA_REPO, path: c.path || 'records.json' } : null;
     this.set(this.cfg ? 'idle' : 'off');
+    // the home screen was drawn before the settings were read: redraw this section so a connected device shows its buttons
+    const sec = $('#cloud'); if (sec) sec.innerHTML = cloudHtml();
     if (!this.cfg || DEMO) return;
     this.listening = true; window.addEventListener('online', () => this.sync());
     this.sync();
