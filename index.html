@@ -642,6 +642,10 @@ const K_LOGS = 'kps.logs.v2', K_DEV = 'kps.device.v1', K_CLOUD = 'kps.cloud.v1',
 /* a short note per study day for the other apps on this site (the 8-week plan ticks its 一問一答 row with it):
    daysum = { YYYYMMDD: [解いた数, 今日の分の残り, 残りの目安(分), 書いた時刻(ms)] }. Also kept in records.json; per day the newer note wins. */
 const K_DAYSUM = 'kps.daysum.v1';
+/* answers per clock hour, per device: hours = { <端末ID>: { YYYYMMDDHH: [解いた数, ○△, 新, 復習, 秒] } } (last 70 days).
+   The 8-week plan counts a night-shift day (until 11:00 the next morning) with it; this app itself does not use it. */
+const K_HOURS = 'kps.hours.v1';
+const hourKey = ms => { const t = new Date(ms); return dnum(t) * 100 + t.getHours(); };
 const PLAN_URL = 'https://unyan478-ux.github.io/kyote-plan/', KAKOMON_URL = 'https://unyan478-ux.github.io/kakomon/';
 const appsNav = () => `<nav class="apps" aria-label="ほかのアプリ"><a href="${PLAN_URL}">予定表</a><a href="${KAKOMON_URL}">過去問</a></nav>`;
 const DATA_REPO = 'unyan478-ux/kokyo-seikei-data';
@@ -663,7 +667,7 @@ function fixPrefs(pr) {
   return P;
 }
 const Store = {
-  prog: {}, marks: {}, logs: {}, log: {}, resetAt: 0, prefs: defaultPrefs(), dev: '', daysum: {},
+  prog: {}, marks: {}, logs: {}, log: {}, resetAt: 0, prefs: defaultPrefs(), dev: '', daysum: {}, hours: {},
   load() {
     const p = LS.get(K_PROG); if (p && typeof p === 'object') this.prog = p;
     const m = LS.get(K_META); if (m && typeof m === 'object') { this.marks = obj(m.marks); this.resetAt = +m.resetAt || 0; }
@@ -675,6 +679,7 @@ const Store = {
     this.sumLog();
     this.prefs = fixPrefs(LS.get(K_PREFS));
     this.daysum = obj(LS.get(K_DAYSUM));
+    this.hours = obj(LS.get(K_HOURS));
   },
   mergeLogMap(key, src) {
     let changed = false;
@@ -696,12 +701,12 @@ const Store = {
     this.log = out;
   },
   own(day) { const mine = this.logs[this.dev]; return mine && mine[day] ? mine[day].slice() : null; },
-  saveLocal() { LS.set(K_PROG, this.prog); LS.set(K_META, this.metaDoc()); LS.set(K_LOGS, this.logs); },
+  saveLocal() { LS.set(K_PROG, this.prog); LS.set(K_META, this.metaDoc()); LS.set(K_LOGS, this.logs); LS.set(K_HOURS, this.hours); },
   savePrefs() { this.prefs.at = now(); LS.set(K_PREFS, this.prefs); Cloud.touch(); },
   metaDoc() { return { marks: this.marks, resetAt: this.resetAt }; },
   status(id) { const b = boxOf(id); return b === 0 ? 'new' : b === 1 ? 'ng' : 'ok'; },
   marked(id) { const m = this.marks[id]; return !!(m && m[0]); },
-  record(id, grade, secs) {
+  record(id, grade, secs, at) {
     const t = today(), old = this.prog[id], s = srs(id);
     const sameDay = !!old && dayOf((+old[3] || 0) * 1000) === t;
     let box, due;
@@ -722,17 +727,26 @@ const Store = {
     L[0]++; if (grade !== 'ng') L[1]++; if (!old) L[2]++; else L[3]++;
     L[4] += Math.round(Math.min(120, Math.max(1, secs || 0)));
     mine[t] = L;
+    const hk = hourKey(at || Date.now()), hm = this.hours[this.dev] || (this.hours[this.dev] = {});
+    const H = (hm[hk] || [0, 0, 0, 0, 0]).slice();
+    H[0]++; if (grade !== 'ng') H[1]++; if (!old) H[2]++; else H[3]++;
+    H[4] += Math.round(Math.min(120, Math.max(1, secs || 0)));
+    hm[hk] = H;
+    const oldest = hourKey(Date.now() - 70 * 864e5);
+    for (const k in hm) if (+k < oldest) delete hm[k];
     this.sumLog(); this.saveLocal(); noteToday(); Cloud.touch();
     return { box, due, isNew: !old };
   },
-  restore(id, rec, day, ownEntry) {
+  restore(id, rec, day, ownEntry, hk, hourEntry) {
     if (rec) this.prog[id] = rec; else delete this.prog[id];
     const mine = this.logs[this.dev] || (this.logs[this.dev] = {});
     if (ownEntry) mine[day] = ownEntry; else delete mine[day];
+    if (hk) { const hm = this.hours[this.dev] || (this.hours[this.dev] = {}); if (hourEntry) hm[hk] = hourEntry; else delete hm[hk]; }
     this.sumLog();
   },
+  ownHour(hk) { const hm = this.hours[this.dev]; return hm && hm[hk] ? hm[hk].slice() : null; },
   toggleMark(id) { const on = !this.marked(id); this.marks[id] = [on ? 1 : 0, Math.max(now(), this.resetAt + 1)]; this.saveLocal(); Cloud.touch(); return on; },
-  reset() { this.resetAt = now(); this.prog = {}; this.marks = {}; this.logs = {}; this.sumLog(); this.saveLocal(); LS.del(K_SESSION); Cloud.touch(); },
+  reset() { this.resetAt = now(); this.prog = {}; this.marks = {}; this.logs = {}; this.hours = {}; this.sumLog(); this.saveLocal(); LS.del(K_SESSION); Cloud.touch(); },
 };
 function srs(id) {
   const r = Store.prog[id];
@@ -748,7 +762,7 @@ function spread(id) { let h = 0; for (let i = 0; i < id.length; i++) h = (h * 31
 /* ---------- one copy of the records: the cloud file, a backup file, an old claude.ai export ----------
    { app:'kps', v:2, savedAt, by, resetAt, prog, marks, logs, prefs }   (v1 files have one shared `log` instead of `logs`) */
 function recordsDoc() {
-  return { app: 'kps', v: 2, savedAt: now(), by: Store.dev, resetAt: Store.resetAt, prog: Store.prog, marks: Store.marks, logs: Store.logs, prefs: Store.prefs, daysum: Store.daysum };
+  return { app: 'kps', v: 2, savedAt: now(), by: Store.dev, resetAt: Store.resetAt, prog: Store.prog, marks: Store.marks, logs: Store.logs, prefs: Store.prefs, daysum: Store.daysum, hours: Store.hours };
 }
 /* write today's note when the numbers changed (never on their own a reason to send: it rides along with the next answers) */
 function noteToday() {
@@ -759,6 +773,26 @@ function noteToday() {
   const old = addD(p.t, -21);
   for (const k in Store.daysum) if (+k < old) delete Store.daysum[k];
   LS.set(K_DAYSUM, Store.daysum);
+}
+function mergeHours(rh) {
+  let changed = false;
+  for (const k in obj(rh)) {
+    const src = obj(rh[k]), dst = Store.hours[k] || (Store.hours[k] = {});
+    for (const h in src) {
+      const r = src[h]; if (!Array.isArray(r)) continue;
+      const l = dst[h] || [0, 0, 0, 0, 0], m = l.map((x, i) => Math.max(+x || 0, +r[i] || 0));
+      if (!dst[h] || m.some((x, i) => x !== l[i])) { dst[h] = m; changed = true; }
+    }
+  }
+  return changed;
+}
+/* the other copy lacks an hour this device has (e.g. an older version of the app wrote it without hours) */
+function hoursBehind(rh) {
+  for (const k in Store.hours) {
+    const theirs = obj(obj(rh)[k]);
+    for (const h in Store.hours[k]) { const r = theirs[h]; if (!Array.isArray(r) || Store.hours[k][h].some((x, i) => x > (+r[i] || 0))) return true; }
+  }
+  return false;
 }
 function mergeDaysum(rs) {
   let n = 0;
@@ -777,7 +811,7 @@ function mergeDoc(d) {
     Store.resetAt = rReset;
     for (const id in Store.prog) if (!(+Store.prog[id][3] > rReset)) { delete Store.prog[id]; changed = true; }
     for (const id in Store.marks) if (!(+Store.marks[id][1] > rReset)) { delete Store.marks[id]; changed = true; }
-    Store.logs = {}; changed = true;
+    Store.logs = {}; Store.hours = {}; changed = true;
   } else if (Store.resetAt > rReset) behind = true;
   const rp = obj(d.prog);
   let updated = 0, total = 0;
@@ -806,6 +840,8 @@ function mergeDoc(d) {
     if (d.logs && typeof d.logs === 'object') { for (const k in d.logs) changed = Store.mergeLogMap(k, d.logs[k]) || changed; }
     else if (d.log && typeof d.log === 'object') changed = Store.mergeLogMap('base', d.log.d && typeof d.log.d === 'object' ? d.log.d : d.log) || changed;
   }
+  if (rReset >= Store.resetAt) changed = mergeHours(d.hours) || changed;
+  if (!behind && hoursBehind(d.hours)) behind = true;
   const rl = obj(d.logs);
   for (const k in Store.logs) {
     const theirs = obj(rl[k]);
@@ -1467,9 +1503,10 @@ function renderQuestion() {
 }
 function commit(grade) {
   const id = cur.q.id, t = today();
-  cur.undo = { rec: Store.prog[id] ? Store.prog[id].slice() : null, day: t, log: Store.own(t) };
+  const at = Date.now(), hk = hourKey(at);
+  cur.undo = { rec: Store.prog[id] ? Store.prog[id].slice() : null, day: t, log: Store.own(t), at, hk, hour: Store.ownHour(hk) };
   cur.grade = grade; cur.ok = grade !== 'ng';
-  cur.info = Store.record(id, grade, (Date.now() - cur.t0) / 1000);
+  cur.info = Store.record(id, grade, (at - cur.t0) / 1000, at);
   S.res.push({ id, ok: cur.ok, g: grade, b: cur.info.box });
   S.i = cur.n;
   if (grade === 'ng' && !S.re.includes(id)) { S.re.push(id); S.ids.splice(Math.min(S.ids.length, S.i + 4), 0, id); }
@@ -1478,8 +1515,8 @@ function commit(grade) {
 function markFluke() {
   if (!cur || cur.phase !== 'done' || cur.grade !== 'ok' || cur.fluke) return;
   const id = cur.q.id, u = cur.undo;
-  Store.restore(id, u.rec, u.day, u.log);
-  cur.info = Store.record(id, 'meh', (Date.now() - cur.t0) / 1000);
+  Store.restore(id, u.rec, u.day, u.log, u.hk, u.hour);
+  cur.info = Store.record(id, 'meh', (Date.now() - cur.t0) / 1000, u.at);
   cur.grade = 'meh'; cur.fluke = true;
   const last = S.res[S.res.length - 1]; if (last && last.id === id) { last.g = 'meh'; last.b = cur.info.box; }
   LS.set(K_SESSION, S);
@@ -1922,10 +1959,23 @@ function selfTest() {
     const q9 = Q[9].id, own0 = Store.own(day), tot0 = (Store.log[day] || [0])[0];
     Store.record(q9, 'ok', 5); Store.restore(q9, null, day, own0);
     if ((Store.log[day] || [0])[0] !== tot0) errs.push('restore own log ' + JSON.stringify(Store.log[day]) + ' vs ' + tot0);
+    // answers per clock hour (for the plan's night-shift days): kept per device, undone with the answer, merged by the larger number
+    const hq = Q[11].id, at1 = Date.now(), hk1 = hourKey(at1), h0 = Store.ownHour(hk1), o0 = Store.own(today()), r0 = Store.prog[hq] ? Store.prog[hq].slice() : null;
+    Store.record(hq, 'ok', 5, at1);
+    const h1 = Store.ownHour(hk1);
+    if (!h1 || h1[0] !== (h0 ? h0[0] : 0) + 1 || h1[r0 ? 3 : 2] !== (h0 ? h0[r0 ? 3 : 2] : 0) + 1) errs.push('hour bucket ' + JSON.stringify(h1) + ' was ' + JSON.stringify(h0));
+    Store.restore(hq, r0, today(), o0, hk1, h0);
+    if (JSON.stringify(Store.ownHour(hk1)) !== JSON.stringify(h0)) errs.push('hour undo ' + JSON.stringify(Store.ownHour(hk1)));
+    mergeDoc({ app: 'kps', v: 2, prog: {}, hours: { dOTHER: { 2026112806: [3, 2, 1, 2, 60] } } });
+    mergeDoc({ app: 'kps', v: 2, prog: {}, hours: { dOTHER: { 2026112806: [2, 2, 2, 0, 30] } } });
+    if (JSON.stringify(Store.hours.dOTHER[2026112806]) !== '[3,2,2,2,60]') errs.push('hours merge ' + JSON.stringify(Store.hours.dOTHER));
+    if (!recordsDoc().hours.dOTHER) errs.push('hours in file');
+    if (!mergeDoc({ app: 'kps', v: 2, resetAt: Store.resetAt, prog: Store.prog, marks: Store.marks, logs: Store.logs, prefs: Store.prefs }).behind) errs.push('a copy without hours gets them back');
     // a reset on another device wins over older records
     const rs = now() + 500;   // later than the record moved 100 s ahead above, whatever the demo data
     mr = mergeDoc({ app: 'kps', v: 2, resetAt: rs, prog: {}, marks: {}, logs: {} });
     if (Object.keys(Store.prog).length || Object.keys(Store.log).length || Store.resetAt !== rs) errs.push('remote reset ' + Object.keys(Store.prog).length);
+    if (Object.keys(Store.hours).length) errs.push('remote reset hours');
     // the daily note for the plan: the newer note per day wins, and it rides along in the synced file
     Store.daysum = {};
     noteToday();
