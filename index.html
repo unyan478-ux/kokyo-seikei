@@ -77,6 +77,10 @@ button { font: inherit; color: inherit; }
 .masthead { background: var(--paper); border-bottom: 1px solid var(--rule); }
 .masthead .wrap { padding-block: 18px 14px; display: grid; gap: 4px; }
 .eyebrow { font-size: 12px; letter-spacing: .08em; color: var(--ink-3); }
+.mast-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.apps { display: flex; gap: 6px; }
+.apps a { font-size: 12.5px; color: var(--ink-2); text-decoration: none; border: 1px solid var(--rule); border-radius: 999px; padding: 3px 11px; background: var(--paper); white-space: nowrap; }
+.apps a:hover { border-color: var(--ink-3); color: var(--ink); }
 .title { font-family: var(--f-q); font-weight: 700; font-size: clamp(23px, 6vw, 32px); line-height: 1.3; text-wrap: balance; }
 .stamp { display: inline-block; vertical-align: .25em; margin-left: .45em; font-family: var(--f-ui); font-size: 13px; letter-spacing: .12em; color: var(--red); border: 2px solid var(--red); border-radius: 6px; padding: 1px 6px 1px 8px; transform: rotate(-5deg); }
 .countdown { font-size: 13.5px; color: var(--ink-2); }
@@ -635,6 +639,11 @@ const isMatch = (input, q) => { const n = normMatch(input); return n.length > 0 
    'base' holds the history from before devices were told apart (merged by taking the larger number).
    Store.log is the sum that the screens show. */
 const K_LOGS = 'kps.logs.v2', K_DEV = 'kps.device.v1', K_CLOUD = 'kps.cloud.v1', K_DIRTY = 'kps.dirty.v1';
+/* a short note per study day for the other apps on this site (the 8-week plan ticks its 一問一答 row with it):
+   daysum = { YYYYMMDD: [解いた数, 今日の分の残り, 残りの目安(分), 書いた時刻(ms)] }. Also kept in records.json; per day the newer note wins. */
+const K_DAYSUM = 'kps.daysum.v1';
+const PLAN_URL = 'https://unyan478-ux.github.io/kyote-plan/', KAKOMON_URL = 'https://unyan478-ux.github.io/kakomon/';
+const appsNav = () => `<nav class="apps" aria-label="ほかのアプリ"><a href="${PLAN_URL}">予定表</a><a href="${KAKOMON_URL}">過去問</a></nav>`;
 const DATA_REPO = 'unyan478-ux/kokyo-seikei-data';
 const TOKEN_URL = 'https://github.com/settings/personal-access-tokens/new?name=kokyo-seikei-sync&description='
   + encodeURIComponent('公共・政経 一問一答の記録の同期用') + '&target_name=unyan478-ux&expires_in=180&contents=write';
@@ -654,7 +663,7 @@ function fixPrefs(pr) {
   return P;
 }
 const Store = {
-  prog: {}, marks: {}, logs: {}, log: {}, resetAt: 0, prefs: defaultPrefs(), dev: '',
+  prog: {}, marks: {}, logs: {}, log: {}, resetAt: 0, prefs: defaultPrefs(), dev: '', daysum: {},
   load() {
     const p = LS.get(K_PROG); if (p && typeof p === 'object') this.prog = p;
     const m = LS.get(K_META); if (m && typeof m === 'object') { this.marks = obj(m.marks); this.resetAt = +m.resetAt || 0; }
@@ -665,6 +674,7 @@ const Store = {
     LS.set(K_DEV, this.dev);
     this.sumLog();
     this.prefs = fixPrefs(LS.get(K_PREFS));
+    this.daysum = obj(LS.get(K_DAYSUM));
   },
   mergeLogMap(key, src) {
     let changed = false;
@@ -712,7 +722,7 @@ const Store = {
     L[0]++; if (grade !== 'ng') L[1]++; if (!old) L[2]++; else L[3]++;
     L[4] += Math.round(Math.min(120, Math.max(1, secs || 0)));
     mine[t] = L;
-    this.sumLog(); this.saveLocal(); Cloud.touch();
+    this.sumLog(); this.saveLocal(); noteToday(); Cloud.touch();
     return { box, due, isNew: !old };
   },
   restore(id, rec, day, ownEntry) {
@@ -738,7 +748,25 @@ function spread(id) { let h = 0; for (let i = 0; i < id.length; i++) h = (h * 31
 /* ---------- one copy of the records: the cloud file, a backup file, an old claude.ai export ----------
    { app:'kps', v:2, savedAt, by, resetAt, prog, marks, logs, prefs }   (v1 files have one shared `log` instead of `logs`) */
 function recordsDoc() {
-  return { app: 'kps', v: 2, savedAt: now(), by: Store.dev, resetAt: Store.resetAt, prog: Store.prog, marks: Store.marks, logs: Store.logs, prefs: Store.prefs };
+  return { app: 'kps', v: 2, savedAt: now(), by: Store.dev, resetAt: Store.resetAt, prog: Store.prog, marks: Store.marks, logs: Store.logs, prefs: Store.prefs, daysum: Store.daysum };
+}
+/* write today's note when the numbers changed (never on their own a reason to send: it rides along with the next answers) */
+function noteToday() {
+  if (!Q.length) return;
+  const p = todayPlan(), v = [p.L[0], p.reviews.length + p.news.length, p.est], o = Store.daysum[p.t];
+  if (o && o[0] === v[0] && o[1] === v[1] && o[2] === v[2]) return;
+  Store.daysum[p.t] = v.concat(Date.now());
+  const old = addD(p.t, -21);
+  for (const k in Store.daysum) if (+k < old) delete Store.daysum[k];
+  LS.set(K_DAYSUM, Store.daysum);
+}
+function mergeDaysum(rs) {
+  let n = 0;
+  for (const k in obj(rs)) {
+    const r = rs[k], l = Store.daysum[k];
+    if (Array.isArray(r) && r.length === 4 && (!l || +r[3] > +l[3])) { Store.daysum[k] = r.map(x => +x || 0); n++; }
+  }
+  if (n) LS.set(K_DAYSUM, Store.daysum);
 }
 /* Fold another copy into this device. Per question and per ☆ the newer answer wins; logs are kept per device;
    a newer "reset" clears what came before it. `behind` = the other copy lacks something this device has. */
@@ -785,6 +813,7 @@ function mergeDoc(d) {
     if (behind) break;
   }
   const rpAt = +(obj(d.prefs).at) || 0;
+  mergeDaysum(d.daysum);
   if (rpAt > Store.prefs.at) { Store.prefs = fixPrefs(d.prefs); LS.set(K_PREFS, Store.prefs); changed = true; }
   else if (Store.prefs.at > rpAt) behind = true;
   Store.sumLog();
@@ -1122,7 +1151,7 @@ function renderHome() {
   const days = daysLeft();
   V.home.innerHTML = `
   <header class="masthead"><div class="wrap">
-    <p class="eyebrow">2027年 大学入学共通テスト対策</p>
+    <div class="mast-top"><p class="eyebrow">2027年 大学入学共通テスト対策</p>${appsNav()}</div>
     <h1 class="title">公共、政治・経済<span class="stamp">一問一答</span></h1>
     ${days > 0 ? `<p class="countdown">本試験 1月16日（土）まで<b>あと${days}日</b></p>` : days === 0 ? '<p class="countdown"><b>今日が本試験です</b></p>' : ''}
   </div></header>
@@ -1153,9 +1182,11 @@ function renderHome() {
     </div>
   </div>`;
   updateCustomInfo();
+  noteToday();
 }
 function refreshHome() {
   if (view !== 'home' || !$('#today')) return;
+  noteToday();
   $('#today').innerHTML = todayHtml();
   $('#progress').innerHTML = progressHtml();
   $('#heat').innerHTML = heatHtml();
@@ -1892,9 +1923,17 @@ function selfTest() {
     Store.record(q9, 'ok', 5); Store.restore(q9, null, day, own0);
     if ((Store.log[day] || [0])[0] !== tot0) errs.push('restore own log ' + JSON.stringify(Store.log[day]) + ' vs ' + tot0);
     // a reset on another device wins over older records
-    const rs = now() + 5;
+    const rs = now() + 500;   // later than the record moved 100 s ahead above, whatever the demo data
     mr = mergeDoc({ app: 'kps', v: 2, resetAt: rs, prog: {}, marks: {}, logs: {} });
     if (Object.keys(Store.prog).length || Object.keys(Store.log).length || Store.resetAt !== rs) errs.push('remote reset ' + Object.keys(Store.prog).length);
+    // the daily note for the plan: the newer note per day wins, and it rides along in the synced file
+    Store.daysum = {};
+    noteToday();
+    const dn = Store.daysum[today()];
+    if (!dn || dn.length !== 4 || dn[0] !== (Store.log[today()] || [0])[0]) errs.push('daysum note ' + JSON.stringify(dn));
+    mergeDoc({ app: 'kps', v: 2, prog: {}, daysum: { 20261201: [5, 0, 0, 100], [today()]: [1, 2, 3, 1] } });
+    if (!Store.daysum[20261201] || Store.daysum[today()][3] === 1) errs.push('daysum merge ' + JSON.stringify(Store.daysum));
+    if (!recordsDoc().daysum || !recordsDoc().daysum[20261201]) errs.push('daysum in file');
     // file content survives base64 with Japanese text
     const txt = JSON.stringify({ a: '公共・政経 ☆', n: 1 });
     if (b64dec(b64enc(txt)) !== txt) errs.push('base64');
@@ -1930,6 +1969,16 @@ function galleryMode() {
 }
 
 /* ---------- boot ---------- */
+/* opened from the 8-week plan (#today): resume a set in progress, or start 今日の分 once the first sync had its chance */
+function fromPlan() {
+  history.replaceState(null, '', location.pathname + location.search);
+  const s = LS.get(K_SESSION);
+  if (s && Array.isArray(s.ids) && s.ids.length && s.i < s.ids.length) { resume(); return; }
+  const go = () => { if (view !== 'home') return; const p = todayPlan(); if (p.reviews.length + p.news.length) todaySession('today'); };
+  let n = 0;
+  const tick = () => { if ((Cloud.state === 'idle' || Cloud.state === 'syncing') && ++n < 50) setTimeout(tick, 100); else go(); };
+  setTimeout(tick, 100);
+}
 function bootError(e) {
   const box = $('#loading');
   if (box) box.innerHTML = `<p>問題を読み込めませんでした（${esc(e && e.message || e)}）。通信の状態を確かめて、もう一度読み込んでください。</p><button type="button" class="btn primary" data-act="retry-load">もう一度読み込む</button>`;
@@ -1944,6 +1993,7 @@ function boot() {
     renderHome(); show('home');
     if (h === '#selftest') { DEMO = true; selfTest(); return; }
     if (h.indexOf('#restore=') === 0) restoreFromLink(h.slice(9));
+    else if (h === '#today') fromPlan();
     else if (freshLook(LS.get(K_SESSION))) resume();
     Cloud.init();
   }).catch(bootError);
